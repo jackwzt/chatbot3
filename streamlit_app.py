@@ -6,8 +6,8 @@ st.set_page_config(layout="wide")
 st.title("🧠 Multi-Persona Debate Chat UI")
 
 # Fixed API key and endpoint
-API_KEY = "AIzaSyClp-Bmp477Dc2lR0OMDXwBcc9uoEfCYZQ"
-DASHSCOPE_ENDPOINT = "https://generativelanguage.googleapis.com"
+API_KEY = "sk-iatujsoeiwtzoffknvnpfeephnhlytkzmwiakgibxktozovz"
+DASHSCOPE_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
 HEADERS = {
     "Content-Type": "application/json",
     "Authorization": f"Bearer {API_KEY}"
@@ -46,7 +46,7 @@ for persona in st.session_state.personas:
 
 def call_dashscope_api(messages):
     body = {
-        "model": "gemini-2.5-flash",
+        "model": "deepseek-ai/DeepSeek-R1",
         "messages": messages,
         "temperature": 0.3
     }
