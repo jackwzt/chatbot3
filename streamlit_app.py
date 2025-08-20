@@ -6,7 +6,7 @@ st.set_page_config(layout="wide")
 st.title("🧠 Multi-Persona Debate Chat UI")
 
 # Fixed API key and endpoint
-API_KEY = "sk-iatujsoeiwtzoffknvnpfeephnhlytkzmwiakgibxktozovz"
+API_KEY = ""
 DASHSCOPE_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
 HEADERS = {
     "Content-Type": "application/json",
