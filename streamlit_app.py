@@ -1,21 +1,38 @@
 import streamlit as st
 import requests
+import time
 
-# Config
+# -----------------------------------------------------------------------------
+# Page config
+# -----------------------------------------------------------------------------
 st.set_page_config(layout="wide")
-st.title("🧠 Multi-Persona Debate Chat UI")
+st.title("🧠 Multi-Persona Debate Chat UI (Gemini 2.5 Flash)")
 
-# Fixed API key and endpoint
-API_KEY = ""
-DASHSCOPE_ENDPOINT = "https://api.siliconflow.cn/v1/chat/completions"
-HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {API_KEY}"
-}
+# -----------------------------------------------------------------------------
+# API key & endpoint
+# -----------------------------------------------------------------------------
+# Expect a .streamlit/secrets.toml with
+# GEMINI_API_KEY = "your-real-key"
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    st.error("🔴 Configuration Error: Please set 'GEMINI_API_KEY' in .streamlit/secrets.toml.")
+    GEMINI_API_KEY = None
 
-# Topic input
+# Gemini 2.5 Flash endpoint
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+
+
+# -----------------------------------------------------------------------------
+# Default topic (trolley dilemma)
+# -----------------------------------------------------------------------------
 if "topic" not in st.session_state:
-    st.session_state.topic = "Enter your topic here"
+    st.session_state.topic = (
+        "A runaway trolley is heading toward five workers who cannot get off the track in time. "
+        "You are standing next to a switch. If you pull the switch, the trolley will be diverted "
+        "onto a side track where there is one worker, who will be killed. "
+        "If you do nothing, the five workers will die. Should you pull the switch?"
+    )
 
 new_topic = st.text_input("Enter a topic for debate:", st.session_state.topic)
 if new_topic != st.session_state.topic:
@@ -23,132 +40,396 @@ if new_topic != st.session_state.topic:
     st.session_state.debate_rounds = []
     st.session_state.bookmarks = {}
 
-st.markdown(f"### Topic: {st.session_state.topic}")
+st.markdown(f"### Current Debate Topic: {st.session_state.topic}")
 
-# Initialize session state
+
+# -----------------------------------------------------------------------------
+# Personas & state initialisation
+# -----------------------------------------------------------------------------
 if "personas" not in st.session_state:
     st.session_state.personas = [
-        {"name": "The Rational Analyst", "desc": "You are a rational decision analyst. Rely strictly on logic, statistical evidence, and expected value. Avoid emotional language. Your goal is to provide normatively correct choices regardless of human intuitions or biases."},
-        {"name": "The Intuitive Humanist", "desc": "You are a humanistic advisor who cares deeply about emotions, fairness, and perceived losses. You reason like a typical human, placing greater weight on loss aversion, fairness, and emotionally charged outcomes."},
-        {"name": "The Devil’s Advocate", "desc": "Your role is to challenge the consensus and expose flawed reasoning. Always question assumptions, point out inconsistencies or missing data, and provide counterarguments even if they are unpopular."},
-        
-        {"name": "The Moderator", "desc": "You are a moderator who observes and summarises the debate. You introduce rounds, connect points, and provide brief summaries after each round."},
+        {
+            "name": "The Rational Analyst",
+            "desc": (
+                "You are a rational decision analyst. Rely strictly on logic, "
+                "statistical evidence, and expected value. Avoid emotional language. "
+                "Your goal is to provide normatively correct choices regardless of "
+                "human intuitions or biases."
+            ),
+        },
+        {
+            "name": "The Intuitive Humanist",
+            "desc": (
+                "You are a humanistic advisor who cares deeply about emotions, "
+                "fairness, and perceived losses. You reason like a typical human, "
+                "placing greater weight on loss aversion, fairness, and emotionally "
+                "charged outcomes."
+            ),
+        },
+        {
+            "name": "The Devil’s Advocate",
+            "desc": (
+                "Your role is to challenge the consensus and expose flawed reasoning. "
+                "Always question assumptions, point out inconsistencies or missing "
+                "data, and provide counterarguments even if they are unpopular."
+            ),
+        },
+        {
+            "name": "The Moderator",
+            "desc": (
+                "You are a moderator who observes and summarises the debate. You "
+                "introduce rounds, connect points, and provide brief summaries after "
+                "each round. You also offer a provisional verdict on the most "
+                "defensible position and highlight open disagreements."
+                "Make the final decision."
+            ),
+        },
     ]
 
 if "debate_rounds" not in st.session_state:
     st.session_state.debate_rounds = []
+
 if "bookmarks" not in st.session_state:
-    st.session_state.bookmarks = {}
+    st.session_state.bookmarks = {p["name"]: [] for p in st.session_state.personas}
 
-for persona in st.session_state.personas:
-    if persona['name'] not in st.session_state.bookmarks:
-        st.session_state.bookmarks[persona['name']] = []
 
-def call_dashscope_api(messages):
-    body = {
-        "model": "deepseek-ai/DeepSeek-R1",
-        "messages": messages,
-        "temperature": 0.3
-    }
-    response = requests.post(DASHSCOPE_ENDPOINT, headers=HEADERS, json=body)
-    if response.status_code == 200:
-        return response.json()["choices"][0]["message"]["content"]
-    else:
-        st.error(f"API Error: {response.status_code} - {response.text}")
+# -----------------------------------------------------------------------------
+# Gemini API wrapper
+# -----------------------------------------------------------------------------
+def call_gemini_api(messages):
+    """Call Gemini 2.5 Flash with a system + user message structure.
+
+    messages: list of dicts with keys {"role", "content"}, where
+      - messages[0] is the system instruction
+      - messages[1] is the user prompt
+    """
+    if not GEMINI_API_KEY:
         return None
 
-# Persona display panel
+    if (
+        len(messages) < 2
+        or messages[0]["role"] != "system"
+        or messages[1]["role"] != "user"
+    ):
+        st.error("Internal Error: Messages list structure is unexpected.")
+        return None
+
+    system_instruction_content = messages[0]["content"]
+    user_prompt_content = messages[1]["content"]
+
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": user_prompt_content}],
+            }
+        ],
+        "systemInstruction": {
+            "parts": [{"text": system_instruction_content}],
+        },
+    }
+
+    headers = {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    max_retries = 3
+    delay = 1
+
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(GEMINI_ENDPOINT, headers=headers, json=body)
+
+            # Retry for transient errors
+            if response.status_code in (429, 503) and attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+
+            if "candidates" not in data or not data["candidates"]:
+                st.warning("The response was empty or blocked by safety settings.")
+                return f"⚠️ Response blocked or empty: {data.get('promptFeedback', 'Unknown reason')}"
+
+            return data["candidates"][0]["content"]["parts"][0]["text"]
+
+        except requests.exceptions.HTTPError:
+            st.error(f"Gemini API HTTP Error: {response.status_code} - {response.text}")
+            return None
+        except requests.exceptions.RequestException as e:
+            st.error(f"Gemini API Request Error: {e}")
+            return None
+        except Exception as e:
+            st.error(f"Error processing Gemini response: {e}")
+            return None
+
+    return None
+
+
+# -----------------------------------------------------------------------------
+# Sidebar: show personas
+# -----------------------------------------------------------------------------
 st.sidebar.header("👥 Personas in Debate")
-for i, persona in enumerate(st.session_state.personas):
+for persona in st.session_state.personas:
     with st.sidebar.expander(persona["name"], expanded=True):
         st.write(persona["desc"])
 
-def generate_interactive_debate_round():
-    prompt = [
-        {"role": "system", "content": "You are a debate moderator. Each persona should respond to the others' arguments as if in real conversation. Include a summary from the Moderator at the end. Use turn-taking structure with back-and-forth critique or support. Format clearly by persona."},
-        {"role": "user", "content": f"Debate topic: {st.session_state.topic}\n\nSimulate one round of dynamic interaction between the following personas, each reacting to at least one other:\n" + "\n".join([f"- {p['name']}: {p['desc']}" for p in st.session_state.personas]) + "\n\nOutput a full conversational round where personas address one another’s reasoning, ending with a short summary from the Moderator."}
-    ]
-    return call_dashscope_api(prompt)
 
-# Start debate round
+# -----------------------------------------------------------------------------
+# Construct prompt for one interactive debate round
+# -----------------------------------------------------------------------------
+def generate_interactive_debate_round():
+    persona_list_text = "\n".join(
+        [f"- {p['name']}: {p['desc']}" for p in st.session_state.personas]
+    )
+
+    system_prompt = (
+        "You are orchestrating a vivid, intellectually engaging multi-persona debate. "
+        "Each persona has a distinct perspective and should speak in their own voice. "
+        "They must explicitly reference, criticise, or support at least one other "
+        "persona in their turn, creating real back-and-forth interaction.\n\n"
+        "The debate must be clearly structured with headings in the following format:\n"
+        "### The Rational Analyst\n"
+        "…their contribution…\n\n"
+        "### The Intuitive Humanist\n"
+        "…their contribution…\n\n"
+        "### The Devil’s Advocate\n"
+        "…their contribution…\n\n"
+        "### The Moderator – Round Summary and Provisional Result\n"
+        "In this final section, the Moderator summarises key agreements and "
+        "disagreements, then states a brief provisional verdict on which position "
+        "is currently best-supported by reasons and evidence, while noting remaining "
+        "uncertainties.\n\n"
+        "Keep the tone analytical but lively, avoid repetition across rounds, and "
+        "ensure the output is a single coherent Markdown block."
+    )
+
+    user_prompt = (
+        f"Debate topic: {st.session_state.topic}\n\n"
+        "Simulate exactly one round of dynamic interaction between the following personas.\n"
+        "Each persona must:\n"
+        "1. Clearly state their stance on the topic.\n"
+        "2. React explicitly to at least one other persona's reasoning (by name).\n"
+        "3. Introduce at least one concrete consideration (example, trade-off, scenario).\n\n"
+        "Personas:\n"
+        f"{persona_list_text}\n\n"
+        "Follow the heading structure exactly as described in the system instruction."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    return call_gemini_api(messages)
+
+
+# -----------------------------------------------------------------------------
+# Start debate round button
+# -----------------------------------------------------------------------------
 if st.button("Start Interactive Debate Round"):
-    response = generate_interactive_debate_round()
-    if response:
-        parsed_personas = {p['name']: "" for p in st.session_state.personas}
+    with st.spinner(
+        f"Generating Round {len(st.session_state.debate_rounds) + 1} on '{st.session_state.topic}'..."
+    ):
+        response = generate_interactive_debate_round()
+
+    if response and not response.startswith("⚠️ Response blocked"):
+        parsed_personas = {p["name"]: "" for p in st.session_state.personas}
         moderator_summary = ""
 
+        # Find headings and slice content
+        start_indices = {}
         for persona in st.session_state.personas:
-            if persona['name'] in response:
-                start = response.find(persona['name'])
-                next_names = [p['name'] for p in st.session_state.personas if p['name'] != persona['name'] and p['name'] in response[start:]]
-                end = response.find(next_names[0], start) if next_names else len(response)
-                parsed_personas[persona['name']] = response[start:end].strip()
-                if persona['name'] == "The Moderator":
-                    moderator_summary = parsed_personas[persona['name']]
+            heading = f"### {persona['name']}"
+            idx = response.find(heading)
+            if idx != -1:
+                start_indices[persona["name"]] = idx
 
-        st.session_state.debate_rounds.append({
-            "text": response,
-            "parsed": parsed_personas,
-            "moderator_summary": moderator_summary
-        })
+        sorted_names = sorted(start_indices.keys(), key=lambda k: start_indices[k])
 
-# Show rounds and bookmarking
+        for i, name in enumerate(sorted_names):
+            start = start_indices[name] + len(f"### {name}")
+            if i + 1 < len(sorted_names):
+                next_name = sorted_names[i + 1]
+                end = start_indices[next_name]
+            else:
+                end = len(response)
+            content = response[start:end].strip()
+            parsed_personas[name] = content
+            if name == "The Moderator":
+                moderator_summary = content
+
+        st.session_state.debate_rounds.append(
+            {
+                "text": response,
+                "parsed": parsed_personas,
+                "moderator_summary": moderator_summary,
+            }
+        )
+    elif response and response.startswith("⚠️ Response blocked"):
+        st.error(response)
+
+
+# -----------------------------------------------------------------------------
+# Display rounds & bookmarking
+# -----------------------------------------------------------------------------
 if st.session_state.debate_rounds:
-    tabs = st.tabs([f"Round {i+1}" for i in range(len(st.session_state.debate_rounds))] + ["Summary"])
-    for i, tab in enumerate(tabs[:-1]):
-        with tab:
+    tab_labels = [
+        f"Round {i + 1}" for i in range(len(st.session_state.debate_rounds))
+    ] + ["Summary"]
+    tabs = st.tabs(tab_labels)
+
+    for i, round_tab in enumerate(tabs[:-1]):
+        with round_tab:
             round_data = st.session_state.debate_rounds[i]
             st.markdown(round_data["text"])
-            for persona in st.session_state.personas:
-                with st.expander(f"Bookmark for {persona['name']}"):
-                    content = round_data["parsed"].get(persona['name'], "")
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        if st.button(f"👍 Relevant ({persona['name']})", key=f"bookmark_up_{i}_{persona['name']}"):
-                            st.session_state.bookmarks[persona['name']].append({"content": content, "relevance": "Relevant"})
-                    with col2:
-                        if st.button(f"👎 Not Relevant ({persona['name']})", key=f"bookmark_down_{i}_{persona['name']}"):
-                            st.session_state.bookmarks[persona['name']].append({"content": content, "relevance": "Not Relevant"})
+
+            st.markdown("---")
+            st.markdown("#### Bookmark Arguments for Future Reference")
+
+            cols = st.columns(len(st.session_state.personas))
+            for j, persona in enumerate(st.session_state.personas):
+                with cols[j]:
+                    st.markdown(f"**{persona['name']}**")
+                    content = round_data["parsed"].get(persona["name"], "")
+                    if content:
+                        if st.button(
+                            "👍 Relevant",
+                            key=f"bookmark_up_{i}_{persona['name']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.bookmarks[persona["name"]].append(
+                                {
+                                    "round": i + 1,
+                                    "content": content,
+                                    "relevance": "Relevant",
+                                }
+                            )
+                            st.toast(
+                                f"Bookmarked {persona['name']}'s relevant point from Round {i + 1}!"
+                            )
+
+                        if st.button(
+                            "👎 Not Relevant",
+                            key=f"bookmark_down_{i}_{persona['name']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state.bookmarks[persona["name"]].append(
+                                {
+                                    "round": i + 1,
+                                    "content": content,
+                                    "relevance": "Not Relevant",
+                                }
+                            )
+                            st.toast(
+                                f"Bookmarked {persona['name']}'s irrelevant point from Round {i + 1}!"
+                            )
+                    else:
+                        st.write("Argument not found for bookmarking.")
 
     with tabs[-1]:
-        st.subheader("🧭 Moderator Summaries by Round")
+        st.subheader("🧭 Moderator Summaries and Provisional Results by Round")
         for i, round_data in enumerate(st.session_state.debate_rounds):
             if round_data.get("moderator_summary"):
-                st.markdown(f"**Round {i+1}:** {round_data['moderator_summary']}")
+                summary_content = round_data["moderator_summary"].replace(
+                    "– Round Summary and Provisional Result", ""
+                ).replace("– Round Summary and Updated Result", "")
+                st.markdown(f"**Round {i + 1}:**\n{summary_content}")
+                st.markdown("---")
 
         st.subheader("⭐ Bookmarked Arguments by Persona")
         for persona_name, bookmarks in st.session_state.bookmarks.items():
             if bookmarks:
                 st.markdown(f"#### {persona_name}")
-                for i, b in enumerate(bookmarks):
+                for b in bookmarks:
                     if b["content"].strip():
-                        color = "success" if b["relevance"] == "Relevant" else "warning"
-                        getattr(st, color)(f"Bookmark {i+1} ({b['relevance']}):\n{b['content']}")
+                        color = "green" if b["relevance"] == "Relevant" else "orange"
+                        st.markdown(
+                            f'<div style="background-color: #f0f0f0; padding: 10px; '
+                            f'border-radius: 5px; margin-bottom: 5px; border-left: 4px solid {color};">'
+                            f'**Round {b["round"]}** ({b["relevance"]})'
+                            f'<p style="margin-top: 5px; font-size: 0.9em;">{b["content"]}</p>'
+                            f"</div>",
+                            unsafe_allow_html=True,
+                        )
 
-# Chat follow-up
-if user_prompt := st.chat_input("Continue the debate or ask a follow-up question..."):
-    context = [
-        {"role": "system", "content": "Continue responding in character as the defined personas. Each should interact, reference others’ views, and respond as in a real-time moderated debate. Include a final summary by the Moderator."},
-        {"role": "user", "content": f"Topic: {st.session_state.topic}\n\nQuestion: {user_prompt}\n\nPersonas:\n" + "\n".join([f"- {p['name']}: {p['desc']}" for p in st.session_state.personas])}
+
+# -----------------------------------------------------------------------------
+# Chat follow-up (new rounds)
+# -----------------------------------------------------------------------------
+if user_prompt := st.chat_input(
+    "Continue the debate or ask a follow-up question..."
+):
+    persona_list_text = "\n".join(
+        [f"- {p['name']}: {p['desc']}" for p in st.session_state.personas]
+    )
+
+    system_prompt = (
+        "Continue the debate in the same multi-persona format as before. "
+        "Each persona must speak under their own heading, explicitly reference at "
+        "least one other persona, and introduce new considerations rather than "
+        "repeating earlier points.\n\n"
+        "Use the heading structure:\n"
+        "### The Rational Analyst\n"
+        "### The Intuitive Humanist\n"
+        "### The Devil’s Advocate\n"
+        "### The Moderator – Round Summary and Updated Result\n\n"
+        "The Moderator should provide a concise synthesis of the discussion so far, "
+        "explain whether the provisional verdict has shifted, and clarify the main "
+        "unresolved points. Ensure the output is a single, coherent Markdown block."
+    )
+
+    user_msg = (
+        f"Topic: {st.session_state.topic}\n\n"
+        f"Follow-up question or prompt from the user: {user_prompt}\n\n"
+        "Personas:\n"
+        f"{persona_list_text}\n\n"
+        "Produce exactly one new round of debate following the heading structure "
+        "described in the system instruction."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_msg},
     ]
-    reply = call_dashscope_api(context)
-    if reply:
-        parsed_personas = {p['name']: "" for p in st.session_state.personas}
+
+    with st.spinner(f"Generating follow-up round on '{st.session_state.topic}'..."):
+        reply = call_gemini_api(messages)
+
+    if reply and not reply.startswith("⚠️ Response blocked"):
+        parsed_personas = {p["name"]: "" for p in st.session_state.personas}
         moderator_summary = ""
 
+        start_indices = {}
         for persona in st.session_state.personas:
-            if persona['name'] in reply:
-                start = reply.find(persona['name'])
-                next_names = [p['name'] for p in st.session_state.personas if p['name'] != persona['name'] and p['name'] in reply[start:]]
-                end = reply.find(next_names[0], start) if next_names else len(reply)
-                parsed_personas[persona['name']] = reply[start:end].strip()
-                if persona['name'] == "The Moderator":
-                    moderator_summary = parsed_personas[persona['name']]
+            heading = f"### {persona['name']}"
+            idx = reply.find(heading)
+            if idx != -1:
+                start_indices[persona["name"]] = idx
+
+        sorted_names = sorted(start_indices.keys(), key=lambda k: start_indices[k])
+
+        for i, name in enumerate(sorted_names):
+            start = start_indices[name] + len(f"### {name}")
+            if i + 1 < len(sorted_names):
+                next_name = sorted_names[i + 1]
+                end = start_indices[next_name]
+            else:
+                end = len(reply)
+            content = reply[start:end].strip()
+            parsed_personas[name] = content
+            if name == "The Moderator":
+                moderator_summary = content
 
         round_data = {
             "text": reply,
             "parsed": parsed_personas,
-            "moderator_summary": moderator_summary
+            "moderator_summary": moderator_summary,
         }
         st.session_state.debate_rounds.append(round_data)
         st.chat_message("assistant").markdown(reply)
+    elif reply and reply.startswith("⚠️ Response blocked"):
+        st.error(reply)
